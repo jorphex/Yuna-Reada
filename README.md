@@ -14,6 +14,7 @@ RSS reader Telegram bot
 🌀 /refresh - Force refresh feeds  
 🛌 /cancel - Cancel command  
 
+I think this should be able to handle multiple users, but not having multiple Telegram accounts, I haven't tested it.  
 I'm not really sure about tagging. Best to ignore it as it seems confusing to use on Telegram.
 
 ## Usage
