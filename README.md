@@ -1,4 +1,4 @@
-# Yuna-Reada
+# Yuna Reada
 RSS reader Telegram bot
 
 ## Features
