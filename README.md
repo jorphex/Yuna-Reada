@@ -4,9 +4,6 @@ RSS reader Telegram bot
 ## Features
 ➕ /add - Add a feed, send 5 latest entries  
 ➖ /remove - Remove a feed  
-📌 /tag - Tag a post  
-🧹 /untag - Untag a tagged post  
-🗒 /tags - List tags, filter posts  
 🚫 /block - Block words  
 🟢 /unblock - Unblock words  
 📔 /blocked - List blocked words  
