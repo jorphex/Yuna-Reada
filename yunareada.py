@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 from bs4 import BeautifulSoup as bs
 
 sys.stdout = sys.stderr
-TELEGRAM_BOT_TOKEN = "BOT TOKEN HERE"
+TELEGRAM_BOT_TOKEN = "TELEGRAM_BOT_TOKEN "
 
 latest_post_time = {}  # Keys are chat IDs, values are latest post times for each user
 blocked_words_dict = {}  # Keys are chat IDs, values are sets of blocked words for each user
