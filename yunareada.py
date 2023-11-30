@@ -13,20 +13,17 @@ from urllib.parse import urlparse
 from bs4 import BeautifulSoup as bs
 
 sys.stdout = sys.stderr
-TELEGRAM_BOT_TOKEN = "bot_token_here"
+TELEGRAM_BOT_TOKEN = "BOT TOKEN HERE"
 
-rss_urls = {}  # Keys are chat IDs, values are lists of RSS URLs for each user
 latest_post_time = {}  # Keys are chat IDs, values are latest post times for each user
 blocked_words_dict = {}  # Keys are chat IDs, values are sets of blocked words for each user
 blocked_entries_per_chat = {}  # Keys are chat IDs, values are lists of blocked entries for each user
 user_feeds = {} # Keys are chat IDS, values are RSS feeds
-tagged_posts = {}
 users_started = set()
 FEED_URL = 1
 REMOVE_FEED = 2
 BLOCK_WORD = 3
 UNBLOCK_WORD = 4
-TAG, POST = range(2)
 
 def fetch_rss(chat_id, url, latest_post_time):
     global blocked_words_dict, blocked_entries_per_chat
@@ -183,7 +180,7 @@ def refresh(update: Update, context: CallbackContext):
         try:
             logging.info(f"Running 'refresh' for chat_id {chat_id}: {user_feeds[chat_id]}")
             for feed in user_feeds[chat_id]:
-                fetch_and_send_updates(context, chat_id)  # Removed force_refresh=True
+                fetch_and_send_updates(context, chat_id)
             update.message.reply_text('🙂 Refreshed all feeds and sent new updates.')
         except Exception as e:
             logging.error(f"Error in 'refresh' command: {str(e)}")
@@ -214,7 +211,7 @@ def load_opml(chat_id):
             feed_data = {'text': outline.get('text'), 'xmlUrl': outline.get('xmlUrl')}
             feeds.append(feed_data)
 
-    logging.debug(f"Loaded feeds for chat_id {chat_id}: {feeds}")  # Add a logging statement to see the loaded feeds
+    logging.debug(f"Loaded feeds for chat_id {chat_id}: {feeds}")
 
     return feeds
 
@@ -298,6 +295,9 @@ def add_receive_url(update: Update, context: CallbackContext) -> int:
     # Sort all entries by publish time
     all_entries.sort(key=lambda entry: entry.published_parsed, reverse=False)
 
+    # Inform the user that the five latest articles are being sent
+    context.bot.send_message(chat_id=chat_id, text="📰 Here are the five latest items from your feeds:")
+
     # Select the five latest posts in descending order (newest to oldest)
     latest_entries = sorted(all_entries[-5:], key=lambda entry: entry.published_parsed, reverse=False)
 
@@ -325,6 +325,9 @@ def add_receive_url(update: Update, context: CallbackContext) -> int:
     joined_urls = "\n".join(url for url in url_list)
     update.message.reply_text(f'☺️ Successfully added the RSS feeds:\n{joined_urls}')
 
+    # Inform the user about the XML/OPML file for backup
+    context.bot.send_message(chat_id=chat_id, text="🗃 Here's an XML/OPML file of your feeds for backup:")
+
     filename = f"{chat_id}_feeds.xml"
     try:
         write_opml(feeds, filename)
@@ -350,12 +353,12 @@ def cancel_add(update: Update, context: CallbackContext):
 
 def remove_start(update: Update, context: CallbackContext) -> int:
     chat_id = update.effective_chat.id
-    global rss_urls
+    global user_feeds
 
-    if chat_id not in rss_urls or not rss_urls[chat_id]:
+    if chat_id not in user_feeds or not user_feeds[chat_id]:
         message = '🤷‍♀️ You have no feeds to remove. You can add new feeds using the /add command.'
     else:
-        feed_list = [(feed_dict['text'], feed_dict['xmlUrl']) for feed_dict in rss_urls[chat_id]]
+        feed_list = [(feed_dict['text'], feed_dict['xmlUrl']) for feed_dict in user_feeds[chat_id]]
         feed_list.sort(key=lambda x: x[0])
         message = "Here are your current feeds:\n\n"
         for feed_name, feed_url in feed_list:
@@ -367,7 +370,7 @@ def remove_start(update: Update, context: CallbackContext) -> int:
 
 def remove_receive_feed(update: Update, context: CallbackContext):
     chat_id = update.effective_chat.id
-    global rss_urls
+    global user_feeds
 
     feed = update.message.text.strip()
 
@@ -375,12 +378,12 @@ def remove_receive_feed(update: Update, context: CallbackContext):
         update.message.reply_text('☝️ You must provide a feed title or URL')
         return
 
-    if chat_id not in rss_urls or not rss_urls[chat_id]:
+    if chat_id not in user_feeds or not user_feeds[chat_id]:
         update.message.reply_text('🤷‍♀️ You have no feeds to remove.')
         return
 
     feed_to_remove = None
-    for feed_dict in rss_urls[chat_id]:
+    for feed_dict in user_feeds[chat_id]:
         if feed_dict['text'] == feed or feed_dict['xmlUrl'] == feed:
             feed_to_remove = feed_dict
             break
@@ -389,11 +392,11 @@ def remove_receive_feed(update: Update, context: CallbackContext):
         update.message.reply_text('🤷‍♀️ No matching feed found. Please check the feed title or URL and try again.')
         return
 
-    rss_urls[chat_id] = [feed_dict for feed_dict in rss_urls[chat_id] if feed_dict != feed_to_remove]
+    user_feeds[chat_id] = [feed_dict for feed_dict in user_feeds[chat_id] if feed_dict != feed_to_remove]
 
     # Generate and send the updated OPML file as a document to the user
     opml_filename = f"{chat_id}_feeds.xml"
-    write_opml(rss_urls[chat_id], opml_filename)
+    write_opml(user_feeds[chat_id], opml_filename)
     with open(opml_filename, 'rb') as opml_file:
         context.bot.send_document(chat_id=chat_id, document=opml_file)
 
@@ -472,115 +475,6 @@ def cancel(update: Update, context: CallbackContext) -> int:
     update.message.reply_text('🛌 Command cancelled.')
     return ConversationHandler.END
 
-def tag_start(update: Update, context: CallbackContext) -> int:
-    update.message.reply_text("🔖 Please reply to the post message you want to tag with the desired tag word.")
-    return POST
-
-def tag_receive_post(update: Update, context: CallbackContext) -> int:
-    chat_id = update.effective_chat.id
-    message_id = update.message.reply_to_message.message_id
-    tag = update.message.text.strip().lower()
-    entities = update.message.reply_to_message.entities
-
-    # Extract title and URL from the entities
-    for entity in entities:
-        if entity.type == 'text_link':
-            post_url = entity.url
-            post_title = update.message.reply_to_message.text[entity.offset:entity.offset+entity.length]
-            break
-    else:
-        update.message.reply_text("❌ Unable to extract title and URL from the post.")
-        return ConversationHandler.END
-
-    # Initialize the dictionary for the chat_id if it doesn't exist
-    if chat_id not in tagged_posts:
-        tagged_posts[chat_id] = {}
-
-    # Check if the post is already tagged
-    for posts in tagged_posts[chat_id].values():
-        if any(post['message_id'] == message_id for post in posts):
-            update.message.reply_text("❌ This post is already tagged.")
-            return ConversationHandler.END
-
-    # Save the tag for the post
-    if tag not in tagged_posts[chat_id]:
-        tagged_posts[chat_id][tag] = []
-    tagged_posts[chat_id][tag].append({'message_id': message_id, 'title': post_title, 'url': post_url})
-
-    update.message.reply_text("✅ Post tagged successfully.")
-    return ConversationHandler.END
-
-def untag_start(update: Update, context: CallbackContext) -> int:
-    update.message.reply_text("🔍 Please reply to the post message you want to untag with the tag word to be removed.")
-    return POST
-
-def untag_receive_tag(update: Update, context: CallbackContext) -> int:
-    chat_id = update.effective_chat.id
-    message_id = update.message.reply_to_message.message_id
-    tag = update.message.text.strip().lower()
-
-    # Check if the post is tagged with the specified tag
-    if chat_id not in tagged_posts:
-        update.message.reply_text("❌ This post is not tagged with the specified tag.")
-        return ConversationHandler.END
-
-    tagged_posts_for_user = tagged_posts[chat_id]
-
-    if tag not in tagged_posts_for_user:
-        update.message.reply_text("❌ This post is not tagged with the specified tag.")
-        return ConversationHandler.END
-
-    for post in tagged_posts_for_user[tag]:
-        if post['message_id'] == message_id:
-            tagged_posts_for_user[tag].remove(post)
-            update.message.reply_text("✅ Tag removed successfully.")
-            return ConversationHandler.END
-
-    update.message.reply_text("❌ This post is not tagged with the specified tag.")
-    return ConversationHandler.END
-
-def tags_start(update: Update, context: CallbackContext) -> int:
-    chat_id = update.message.chat_id
-    user_tags = tagged_posts.get(chat_id)
-
-    if not user_tags or not any(user_tags):
-        update.message.reply_text("📌 You have no tags.")
-        return ConversationHandler.END
-
-    tags = list(user_tags.keys())
-    tag_list = "\n".join(f"📌 {tag}" for tag in tags)
-
-    update.message.reply_text(f"🔖 Your saved tags:\n\n{tag_list}\n\nPlease send the tag you want to view posts for, or type /cancel to exit.")
-    return TAG
-
-def tags_receive_tag(update: Update, context: CallbackContext) -> int:
-    selected_tag = update.message.text.lower()
-    chat_id = update.effective_chat.id
-    user_tags = tagged_posts.get(chat_id, {})
-
-    if selected_tag not in user_tags:
-        update.message.reply_text("❌ No posts found for the specified tag.")
-        return ConversationHandler.END
-
-    tagged_entries = []
-    for post in user_tags[selected_tag]:
-        title = post['title']
-        link = post['url']
-        tagged_entries.append((title, link))
-
-    # If there are no tagged entries, let the user know
-    if not tagged_entries:
-        update.message.reply_text("❌ No posts found for the specified tag.")
-        return ConversationHandler.END
-
-    # Build the response
-    response = f"Here are the posts tagged with '{selected_tag}':\n"
-    for title, link in tagged_entries:
-        response += f"📄 [{title}]({link})\n"
-
-    update.message.reply_text(response, parse_mode='Markdown', disable_web_page_preview=True)
-    return ConversationHandler.END
-
 def welcome_user(update: Update, context: CallbackContext):
     user_id = update.effective_user.id
 
@@ -590,17 +484,16 @@ def welcome_user(update: Update, context: CallbackContext):
         I am Yuna Reada, an RSS reader bot! 📚
 
 Here are the available commands:
-➕ /add - Add a feed, send 5 latest entries
-➖ /remove - Remove a feed
-📌 /tag - Tag a post
-🧹 /untag - Untag a tagged post
-🗒 /tags - List tags, filter posts
-🚫 /block - Block words
-🟢 /unblock - Unblock words
-📔 /blocked - List blocked words
-📓 /list - List saved feeds
-🌀 /refresh - Force refresh feeds
-🛌 /cancel - Cancel command
+/add ➕ Add feeds, send 5 latest entries
+/remove ➖ Remove feeds
+/block 🚫 Block words
+/unblock 🟢 Unblock words
+/blocked 📔 List blocked words
+/list 📓 List saved feeds
+/refresh 🌀 Force refresh feeds
+/cancel 🛌 Cancel command
+
+Have a Kindle? Send feed posts to your Kindle easily with @TheKindlerBot 📨
 
 I check feeds for new entries every 15 minutes.
 Send the /add command to begin! 🥰
@@ -651,30 +544,6 @@ def main():
             fallbacks=[CommandHandler('cancel', cancel)],
         )
 
-        tag_handler = ConversationHandler(
-            entry_points=[CommandHandler('tag', tag_start)],
-            states={
-                POST: [MessageHandler(Filters.reply, tag_receive_post)],
-            },
-            fallbacks=[CommandHandler('cancel', cancel)],
-        )
-
-        untag_handler = ConversationHandler(
-            entry_points=[CommandHandler('untag', untag_start)],
-            states={
-                POST: [MessageHandler(Filters.reply, untag_receive_tag)],
-            },
-            fallbacks=[CommandHandler('cancel', cancel)],
-        )
-
-        tags_handler = ConversationHandler(
-            entry_points=[CommandHandler('tags', tags_start)],
-            states={
-                TAG: [MessageHandler(Filters.text, tags_receive_tag)],
-            },
-            fallbacks=[CommandHandler('cancel', cancel)],
-        )
-
         dispatcher.add_handler(remove_handler)
         dispatcher.add_handler(add_handler)
         dispatcher.add_handler(CommandHandler('list', list_feeds))
@@ -682,9 +551,6 @@ def main():
         dispatcher.add_handler(CommandHandler('blocked', list_blocked))
         dispatcher.add_handler(unblock_handler)
         dispatcher.add_handler(block_handler)
-        dispatcher.add_handler(tag_handler)
-        dispatcher.add_handler(untag_handler)
-        dispatcher.add_handler(tags_handler)
         dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, welcome_user))
 
         updater.start_polling()
