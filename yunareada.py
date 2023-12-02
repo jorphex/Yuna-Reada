@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 from bs4 import BeautifulSoup as bs
 
 sys.stdout = sys.stderr
-TELEGRAM_BOT_TOKEN = "TELEGRAM_BOT_TOKEN "
+TELEGRAM_BOT_TOKEN = "TELEGRAM_BOT_TOKEN"
 
 latest_post_time = {}  # Keys are chat IDs, values are latest post times for each user
 blocked_words_dict = {}  # Keys are chat IDs, values are sets of blocked words for each user
@@ -174,14 +174,15 @@ def refresh(update: Update, context: CallbackContext):
     chat_id = update.effective_chat.id
     global user_feeds, latest_post_time
 
+    update.message.reply_text('🔍 Looking for new posts... This might take a moment!')
+
     if chat_id not in user_feeds or not user_feeds[chat_id]:
         update.message.reply_text('😕 You do not have any feeds. You can add new feeds using the /add command.')
     else:
         try:
             logging.info(f"Running 'refresh' for chat_id {chat_id}: {user_feeds[chat_id]}")
-            for feed in user_feeds[chat_id]:
-                fetch_and_send_updates(context, chat_id)
-            update.message.reply_text('🙂 Refreshed all feeds and sent new updates.')
+            fetch_and_send_updates(context, chat_id)
+            update.message.reply_text('🌟 Refreshed all feeds and sent new updates!')
         except Exception as e:
             logging.error(f"Error in 'refresh' command: {str(e)}")
             update.message.reply_text('🥲 An error occurred while refreshing the feeds. Please try again.')
@@ -263,7 +264,7 @@ def add_receive_url(update: Update, context: CallbackContext) -> int:
     if chat_id not in blocked_entries_per_chat:
         blocked_entries_per_chat[chat_id] = []
 
-    update.message.reply_text('👨‍💻 Processing...')
+    update.message.reply_text('👨‍💻 Processing. Please wait!')
 
     raw_urls = update.message.text.strip()
     url_list = re.split(',|\n| ', raw_urls)  # split by commas, newlines or spaces
