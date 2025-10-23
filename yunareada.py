@@ -1,564 +1,482 @@
-from telegram.ext import Updater, CommandHandler, CallbackContext, ConversationHandler, MessageHandler, Filters
-from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
-import feedparser
-import xml.etree.ElementTree as ET
+import asyncio
+import io
 import logging
-import time
-from time import mktime
-from datetime import datetime
-import sys
 import os
 import re
+import shelve
+import time
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from functools import wraps
+from time import mktime
+from typing import List, Optional
 from urllib.parse import urlparse
+import xml.etree.ElementTree as ET
+from xml.etree.ElementTree import indent  # Requires Python 3.9+
+
+import feedparser
 from bs4 import BeautifulSoup as bs
+from telegram import Update
+from telegram.constants import ParseMode
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
+)
 
-sys.stdout = sys.stderr
-TELEGRAM_BOT_TOKEN = "TELEGRAM_BOT_TOKEN"
+# --- Logging ---
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
 
-latest_post_time = {}  # Keys are chat IDs, values are latest post times for each user
-blocked_words_dict = {}  # Keys are chat IDs, values are sets of blocked words for each user
-blocked_entries_per_chat = {}  # Keys are chat IDs, values are lists of blocked entries for each user
-user_feeds = {} # Keys are chat IDS, values are RSS feeds
-users_started = set()
-FEED_URL = 1
-REMOVE_FEED = 2
-BLOCK_WORD = 3
-UNBLOCK_WORD = 4
+# --- Configuration ---
+TELEGRAM_BOT_TOKEN = "6133397985:AAGJhnVYZm2Z9SqSKSAW6Nh7gcqVdtLdMuw"
+if not TELEGRAM_BOT_TOKEN:
+    logger.critical("TELEGRAM_BOT_TOKEN environment variable not set.")
+    exit(1)
 
-def fetch_rss(chat_id, url, latest_post_time):
-    global blocked_words_dict, blocked_entries_per_chat
+# --- Constants ---
+REFRESH_INTERVAL_SECONDS = 15 * 60
+MAX_MESSAGE_LENGTH = 400
+TRUNCATION_SUFFIX = "..."
+TRUNCATED_LENGTH = MAX_MESSAGE_LENGTH - len(TRUNCATION_SUFFIX)
 
-    blocked_words = blocked_words_dict.get(chat_id, set())
+# --- Data Model & Persistence ---
+class UserData:
+    """Represents the data stored for each user."""
+    def __init__(self):
+        self.latest_post_time = {}  # feed URL -> last seen timestamp
+        self.blocked_words = set()  # words/phrases to block
+        self.blocked_entries = []   # transient list for blocked entries summary
+        self.feeds = []             # list of dicts: {'xmlUrl': url, 'text': feed_name}
+
+def get_user_data(shelf, chat_id: int) -> UserData:
+    """
+    Retrieves or creates a UserData object for a given chat_id from the shelf.
+    Shelve keys must be strings.
+    """
+    chat_id_str = str(chat_id)
+    if chat_id_str not in shelf:
+        shelf[chat_id_str] = UserData()
+    return shelf[chat_id_str]
+
+def save_user_data(shelf, chat_id: int, user_data: UserData):
+    """Explicitly saves the UserData object to the shelf for crash-proof persistence."""
+    shelf[str(chat_id)] = user_data
+
+# --- Decorators ---
+def get_user(func):
+    """Decorator to retrieve user_data and pass it to the handler."""
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        chat_id = update.effective_chat.id
+        shelf = context.bot_data['db']
+        user_data = get_user_data(shelf, chat_id)
+        return await func(update, context, user_data=user_data, *args, **kwargs)
+    return wrapper
+
+def user_lock(func):
+    """Decorator to acquire a user-specific lock before modifying data to prevent race conditions."""
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        chat_id = update.effective_chat.id
+        locks = context.bot_data.setdefault('user_locks', {})
+        lock = locks.setdefault(chat_id, asyncio.Lock())
+        async with lock:
+            return await func(update, context, *args, **kwargs)
+    return wrapper
+
+# --- Conversation States ---
+class ConversationState(Enum):
+    """Defines the states for conversation handlers."""
+    FEED_URL = 1
+    REMOVE_FEED = 2
+    BLOCK_WORD = 3
+    UNBLOCK_WORD = 4
+
+# --- RSS Fetching (blocking) ---
+@dataclass
+class FetchResult:
+    """Structured result for the fetch_rss function."""
+    entries: List[feedparser.FeedParserDict] = field(default_factory=list)
+    blocked_entries: List[feedparser.FeedParserDict] = field(default_factory=list)
+    new_latest_post_time: float = 0.0
+    feed_name: Optional[str] = None
+
+def fetch_rss(url: str, latest_post_time: float, blocked_words: set) -> FetchResult:
+    """
+    Fetches and parses an RSS feed. This is a blocking I/O function.
+    """
+    start_time = time.time()
+    logger.info(f"Start fetching RSS for URL {url}")
 
     try:
-        logging.debug(f"latest_post_time in fetch_rss: type {type(latest_post_time)}, value {latest_post_time}")
-
         feed = feedparser.parse(url)
+        if feed.bozo:
+            raise ValueError(f"Malformed feed: {feed.bozo_exception}")
 
-        entries = []
-        blocked_words_used = set()
-        new_latest_post_time = latest_post_time
+        all_new_entries = [
+            entry for entry in feed.entries
+            if entry.get("published_parsed") and mktime(entry.published_parsed) > latest_post_time
+        ]
 
-        for entry in feed.entries:
-            entry_time = entry.get('published_parsed', None)
+        if not all_new_entries:
+            return FetchResult(
+                new_latest_post_time=latest_post_time,
+                feed_name=feed.feed.get("title", "Unknown Feed")
+            )
 
-            if entry_time is None:
-                logging.debug("Skipped an entry due to lack of 'published_parsed' attribute.")
-                continue
+        # Correct Timestamp Logic: Calculate from ALL new entries before filtering
+        new_latest_post_time = max(mktime(e.published_parsed) for e in all_new_entries)
 
-            entry_time = time.mktime(entry_time)
-            new_latest_post_time = max(new_latest_post_time, entry_time)
+        entries, blocked_entries = [], []
+        for entry in all_new_entries:
+            entry.description = bs(entry.get("description", ""), "html.parser").get_text()
+            entry.summary = bs(entry.get("summary", entry.description), "html.parser").get_text()
 
-            soup = bs(entry.description, 'html.parser')
-            entry.description = soup.get_text()
-            if 'summary' in entry:
-                soup = bs(entry.summary, 'html.parser')
-                entry.summary = soup.get_text()
+            # Optimize Blocked Word Check
+            title = (entry.title or "").lower()
+            summary = (entry.summary or "").lower()
+            description = (entry.description or "").lower()
 
-            # Check if the entry should be blocked
-            entry_content = entry.title.lower() + ' ' + entry.description.lower() + ' ' + entry.summary.lower()
-            entry_blocked = False
-            for blocked_word in blocked_words:
-                if blocked_word in entry_content:
-                    entry_blocked = True
-                    break
-
-            if entry_blocked and entry_time > latest_post_time:
-                blocked_entries_per_chat[chat_id].append(entry)
-                blocked_words_used.add(blocked_word)
-            elif not entry_blocked and entry_time > latest_post_time:
+            if any(word in title or word in summary or word in description for word in blocked_words):
+                blocked_entries.append(entry)
+            else:
                 entries.append(entry)
 
-        # Debug lines
-        logging.debug(f"Entries fetched: {len(entries)}")
-        logging.debug(f"New latest post time: {new_latest_post_time}")
-        logging.info(f"Fetched {len(entries)} entries and blocked {len(blocked_entries_per_chat[chat_id])} entries from {url}")
+        feed_name = feed.feed.get("title", "Unknown Feed")
+        logger.info(f"Fetched {len(entries)} new entries from {feed_name} (URL: {url})")
+        return FetchResult(entries, blocked_entries, new_latest_post_time, feed_name)
 
-        # Sort the entries by their publish times
-        entries.sort(key=lambda x: x.get('published_parsed', 0))
-
-        # Update new_latest_post_time based on the latest entry
-        if entries:
-            new_latest_post_time = max(new_latest_post_time, time.mktime(entries[-1].get('published_parsed', 0)))
-
-        feed_name = feed.feed.get('title', '')  # Extract the feed name from the feed data
-
-        return entries, new_latest_post_time, feed_name, blocked_words_used
     except Exception as e:
-        logging.error(f"Error in 'fetch_rss' function: {str(e)}")
-        return [], 0, None, set()
+        logger.error(f"Error fetching RSS for URL {url}: {e}", exc_info=True)
+        return FetchResult(new_latest_post_time=latest_post_time)
+    finally:
+        logger.info(f"Finished fetching RSS for URL {url} in {time.time()-start_time:.2f}s")
 
-def fetch_and_send_updates(context: CallbackContext, chat_id: int):
-    global latest_post_time, blocked_words_dict, user_feeds, blocked_entries_per_chat
+# --- Formatting ---
+def format_entry_message(entry) -> str:
+    """Formats a feed entry into an HTML message for Telegram."""
+    published = datetime.fromtimestamp(mktime(entry.published_parsed))
+    timestamp = published.strftime("%Y-%m-%d %H:%M:%S") + " UTC"
+    
+    # Prefer summary, fallback to description. Content is already plain text.
+    content = entry.summary or entry.description or ""
+    
+    if len(content) > MAX_MESSAGE_LENGTH:
+        content = content[:TRUNCATED_LENGTH] + TRUNCATION_SUFFIX
+        
+    return (
+        f"<a href='{entry.link}'><b>{entry.title}</b></a>\n"
+        f"<code>{timestamp}</code>\n\n{content}"
+    )
 
-    # Create a bot instance using the context
-    bot = context.bot
+# --- Update Functions ---
+async def fetch_and_send_updates(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """Fetches updates for a single user and sends them, with concurrency control."""
+    locks = context.bot_data.setdefault('user_locks', {})
+    lock = locks.setdefault(chat_id, asyncio.Lock())
+    
+    async with lock:
+        shelf = context.bot_data['db']
+        user_data = get_user_data(shelf, chat_id)
+        if not user_data.feeds:
+            return
 
-    if chat_id not in user_feeds:
-        user_feeds[chat_id] = []
-    if chat_id not in latest_post_time:
-        latest_post_time[chat_id] = {}
-    if chat_id not in blocked_words_dict:
-        blocked_words_dict[chat_id] = set()
-    if chat_id not in blocked_entries_per_chat:
-        blocked_entries_per_chat[chat_id] = []
-    else:
-        blocked_entries_per_chat[chat_id].clear()
-
-    try:
+        bot = context.bot
         all_entries = []
-        for url_dict in user_feeds[chat_id]:
-            url = url_dict['xmlUrl']
-            if url not in latest_post_time[chat_id]:
-                latest_post_time[chat_id][url] = 0
-            try:
-                fetched_entries, new_latest_post_time, feed_name, blocked_words_used = fetch_rss(chat_id, url, latest_post_time[chat_id][url])
-            except Exception as e:
-                print(f"Error while fetching RSS or printing first entry: {str(e)}")
+        data_modified = False
+
+        tasks = [
+            asyncio.to_thread(
+                fetch_rss,
+                feed["xmlUrl"],
+                user_data.latest_post_time.get(feed["xmlUrl"], 0),
+                user_data.blocked_words
+            ) for feed in user_data.feeds
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for result, feed in zip(results, user_data.feeds):
+            if isinstance(result, Exception):
+                logger.error(f"Task for {feed['xmlUrl']} failed: {result}")
                 continue
+            
+            if result.entries:
+                all_entries.extend(result.entries)
+                user_data.latest_post_time[feed["xmlUrl"]] = result.new_latest_post_time
+                data_modified = True
+            if result.blocked_entries:
+                user_data.blocked_entries.extend(result.blocked_entries)
+        
+        if data_modified:
+            save_user_data(shelf, chat_id, user_data)
 
-            entries = [entry for entry in fetched_entries if mktime(entry.published_parsed) > latest_post_time[chat_id][url]]
-            all_entries.extend(entries)
+        all_entries.sort(key=lambda e: e.published_parsed, reverse=True)
 
-            logging.info(f"Fetched {len(fetched_entries)} entries from {url}")
-
-            latest_post_time[chat_id][url] = new_latest_post_time
-
-        # Sort all entries by publish time
-        all_entries.sort(key=lambda entry: entry.published_parsed, reverse=True)
-
-        logging.info(f"Sending {len(all_entries)} entries to chat_id {chat_id}")
-
-        # Send the new entries
         for entry in all_entries:
             try:
-                published_time = datetime.fromtimestamp(mktime(entry.published_parsed))
-                utc_timestamp = published_time.strftime("%Y-%m-%d %H:%M:%S") + " UTC"
-
-                description = entry.description
-                summary = entry.summary
-                content = description if len(description) < len(summary) else summary
-
-                # clean HTML tags from content using BeautifulSoup
-                soup = bs(content, 'html.parser')
-                content = soup.get_text(separator="\n")
-                content = (content[:397] + '...') if len(content) > 400 else content
-
-                message = f"<a href='{entry.link}'><b>{entry.title}</b></a>\n<code>{utc_timestamp}</code>\n\n{content}"
-                bot.send_message(chat_id=chat_id, text=message, parse_mode='HTML')
-
+                await bot.send_message(chat_id=chat_id, text=format_entry_message(entry), parse_mode=ParseMode.HTML)
             except Exception as e:
-                print(f"Error while sending message: {str(e)}")
+                logger.error(f"Error sending message for chat {chat_id}: {e}", exc_info=True)
 
-        # After sending all entries, report the blocked entries
-        if blocked_entries_per_chat[chat_id]:  # Only send a report if there were blocked entries
-            blocked_message = '🚫 Blocked {} new posts\n'.format(len(blocked_entries_per_chat[chat_id]))
-            for entry in blocked_entries_per_chat[chat_id]:
-                blocked_message += '<a href="{}">{}</a>\n'.format(entry.link, entry.title)
-            bot.send_message(chat_id=chat_id, text=blocked_message, parse_mode='HTML', disable_web_page_preview=True)
-            
-        # Clear the list of blocked entries for this chat after the report is sent
-        blocked_entries_per_chat[chat_id].clear()
+        if user_data.blocked_entries:
+            blocked_message = f"🚫 Blocked {len(user_data.blocked_entries)} new posts\n" + "\n".join(
+                f'<a href="{entry.link}">{entry.title}</a>' for entry in user_data.blocked_entries
+            )
+            await bot.send_message(chat_id=chat_id, text=blocked_message, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            user_data.blocked_entries = []
 
-    except Exception as e:
-        logging.error(f"Error in 'fetch_and_send_updates' function: {str(e)}")
+async def send_rss_updates(context: ContextTypes.DEFAULT_TYPE):
+    """Job callback to send updates to all users."""
+    shelf = context.bot_data['db']
+    chat_ids = [int(chat_id_str) for chat_id_str in shelf.keys()]
+    await asyncio.gather(*(fetch_and_send_updates(context, chat_id) for chat_id in chat_ids))
 
-def send_rss_updates(context: CallbackContext):
-    for chat_id in user_feeds.keys():
-        try:
-            fetch_and_send_updates(context, chat_id)
-        except Exception as e:
-            logging.error(f"Error while running 'send_rss_updates' job for chat_id {chat_id}: {str(e)}")
-
-def refresh(update: Update, context: CallbackContext):
+async def refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler for the /refresh command. Triggers an immediate update check for the user."""
     chat_id = update.effective_chat.id
-    global user_feeds, latest_post_time
+    await update.message.reply_text("🔍 Looking for new posts... This might take a moment!")
+    await fetch_and_send_updates(context, chat_id)
+    await update.message.reply_text("🌟 Refreshed all feeds and sent new updates!")
 
-    update.message.reply_text('🔍 Looking for new posts... This might take a moment!')
-
-    if chat_id not in user_feeds or not user_feeds[chat_id]:
-        update.message.reply_text('😕 You do not have any feeds. You can add new feeds using the /add command.')
-    else:
-        try:
-            logging.info(f"Running 'refresh' for chat_id {chat_id}: {user_feeds[chat_id]}")
-            fetch_and_send_updates(context, chat_id)
-            update.message.reply_text('🌟 Refreshed all feeds and sent new updates!')
-        except Exception as e:
-            logging.error(f"Error in 'refresh' command: {str(e)}")
-            update.message.reply_text('🥲 An error occurred while refreshing the feeds. Please try again.')
-
-def load_opml(chat_id):
-    opml_file = 'feeds_' + str(chat_id) + '.xml'
-
-    # Check if file exists
-    if not os.path.exists(opml_file):
-        # If not, create a new XML file with basic structure
-        root = ET.Element('opml')
-        body = ET.SubElement(root, 'body')
-        feeds_parent = ET.SubElement(body, 'outline')
-        tree = ET.ElementTree(root)
-        tree.write(opml_file)
-
-    with open(opml_file) as f:
-        content = f.read()
-    bs_content = bs(content, "xml")
-
-    # Look for the nested outline element
-    nested_outline = bs_content.body.outline
-
-    feeds = []
-    if nested_outline:
-        for outline in nested_outline.find_all('outline'):
-            feed_data = {'text': outline.get('text'), 'xmlUrl': outline.get('xmlUrl')}
-            feeds.append(feed_data)
-
-    logging.debug(f"Loaded feeds for chat_id {chat_id}: {feeds}")
-
-    return feeds
-
-def write_opml(feeds, filename):
-    root = ET.Element('opml')
-    body = ET.SubElement(root, 'body')
-    outline_parent = ET.SubElement(body, 'outline')
-
+# --- OPML Helpers ---
+def write_opml(feeds) -> bytes:
+    """Writes a list of feeds to an in-memory OPML file and returns the bytes."""
+    root = ET.Element("opml", version="2.0")
+    body = ET.SubElement(root, "body")
     for feed in feeds:
-        outline = ET.SubElement(outline_parent, 'outline')
-        outline.set('text', feed['text'])
-        outline.set('xmlUrl', feed['xmlUrl'])
-
-    indent(root)  # Apply indentation to the XML tree
-
+        ET.SubElement(body, "outline", text=feed["text"], type="rss", xmlUrl=feed["xmlUrl"])
+    indent(root)
     tree = ET.ElementTree(root)
-    tree.write(filename, encoding='utf-8', xml_declaration=True)
+    
+    with io.BytesIO() as buffer:
+        tree.write(buffer, encoding="utf-8", xml_declaration=True)
+        return buffer.getvalue()
 
-def indent(elem, level=0):
-    i = "\n" + level*"  "
-    if len(elem):
-        if not elem.text or not elem.text.strip():
-            elem.text = i + "  "
-        if not elem.tail or not elem.tail.strip():
-            elem.tail = i
-        for elem in elem:
-            indent(elem, level+1)
-        if not elem.tail or not elem.tail.strip():
-            elem.tail = i
-    else:
-        if level and (not elem.tail or not elem.tail.strip()):
-            elem.tail = i
+# --- Conversation Handlers ---
+async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("📄 Please send an RSS feed URL or URLs separated by commas, spaces, or line breaks.")
+    return ConversationState.FEED_URL
 
-def add_start(update: Update, context: CallbackContext) -> int:
-    update.message.reply_text('📄 Please send an RSS feed URL or URLs separated by commas, spaces, or line breaks.')
-    return FEED_URL
-
-def add_receive_url(update: Update, context: CallbackContext) -> int:
+@user_lock
+@get_user
+async def add_receive_url(update: Update, context: ContextTypes.DEFAULT_TYPE, user_data: UserData) -> int:
     chat_id = update.effective_chat.id
-    global latest_post_time, blocked_words_dict, user_feeds, blocked_entries_per_chat
-
-    # If this is the first time this user interacts with the bot, initialize their state variables
-    if chat_id not in user_feeds:
-        user_feeds[chat_id] = []
-    if chat_id not in latest_post_time:
-        latest_post_time[chat_id] = {}
-    if chat_id not in blocked_words_dict:
-        blocked_words_dict[chat_id] = set()
-    if chat_id not in blocked_entries_per_chat:
-        blocked_entries_per_chat[chat_id] = []
-
-    update.message.reply_text('👨‍💻 Processing. Please wait!')
+    shelf = context.bot_data['db']
+    await update.message.reply_text("👨‍💻 Processing. Please wait!")
 
     raw_urls = update.message.text.strip()
-    url_list = re.split(',|\n| ', raw_urls)  # split by commas, newlines or spaces
-    url_list = [url.strip() for url in url_list if url.strip()]  # remove extra whitespaces and empty elements
+    url_list = [url.strip() for url in re.split(r"[,\n\s]+", raw_urls) if url.strip()]
+    all_entries, newly_added_urls, data_modified = [], [], False
 
-    feeds = []
-    all_entries = []
-
+    tasks = []
     for url in url_list:
         if not is_valid_url(url):
-            update.message.reply_text(f'🙃 Invalid URL detected: {url}')
+            await update.message.reply_text(f"🙃 Invalid URL detected: {url}")
+            continue
+        if any(feed["xmlUrl"] == url for feed in user_data.feeds):
+            await update.message.reply_text(f"😕 RSS feed is already added: {url}")
+            continue
+        tasks.append(asyncio.to_thread(fetch_rss, url, 0, user_data.blocked_words))
+        newly_added_urls.append(url)
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for url, result in zip(newly_added_urls, results):
+        if isinstance(result, Exception) or result.feed_name is None:
+            logger.error(f"Error fetching URL {url}: {result}", exc_info=True)
+            await update.message.reply_text(f"😤 Failed to fetch RSS feed from {url}.")
             continue
 
-        if url in (feed_dict['xmlUrl'] for feed_dict in user_feeds[chat_id]):
-            update.message.reply_text(f'😕 RSS feed is already added: {url}')
-            continue
+        user_data.feeds.append({"xmlUrl": url, "text": result.feed_name})
+        all_entries.extend(result.entries)
+        user_data.latest_post_time[url] = result.new_latest_post_time
+        data_modified = True
 
-        try:
-            entries, new_latest_post_time, feed_name, blocked_words_used = fetch_rss(chat_id, url, latest_post_time[chat_id].get(url, 0))
-            feed_name = feed_name if feed_name else "Unknown Feed"
-            feeds.append({'xmlUrl': url, 'text': feed_name})
-            all_entries.extend(entries)
-            latest_post_time[chat_id][url] = new_latest_post_time
-        except Exception as e:
-            logging.error(f"Error in 'fetch_rss': {str(e)}")
-            update.message.reply_text(f'😤 Failed to fetch RSS feed from {url}. Please check the URL and try again.')
-            continue
+    if not data_modified:
+        return ConversationHandler.END
 
-    # Sort all entries by publish time
-    all_entries.sort(key=lambda entry: entry.published_parsed, reverse=False)
+    save_user_data(shelf, chat_id, user_data)
+    await update.message.reply_text("☺️ Successfully added RSS feeds:\n" + "\n".join(newly_added_urls))
 
-    # Inform the user that the five latest articles are being sent
-    context.bot.send_message(chat_id=chat_id, text="📰 Here are the five latest items from your feeds:")
+    latest_entries = sorted(all_entries, key=lambda e: e.published_parsed, reverse=True)[:5]
+    if latest_entries:
+        await context.bot.send_message(chat_id=chat_id, text="📰 Here are the five latest items from your new feeds:")
+        for entry in latest_entries:
+            await context.bot.send_message(chat_id=chat_id, text=format_entry_message(entry), parse_mode=ParseMode.HTML)
 
-    # Select the five latest posts in descending order (newest to oldest)
-    latest_entries = sorted(all_entries[-5:], key=lambda entry: entry.published_parsed, reverse=False)
-
-    # Send the new entries
-    for entry in latest_entries:
-        try:
-            published_time = datetime.fromtimestamp(mktime(entry.published_parsed))
-            utc_timestamp = published_time.strftime("%Y-%m-%d %H:%M:%S") + " UTC"
-
-            description = entry.description
-            summary = entry.summary
-            content = description if len(description) < len(summary) else summary
-
-            # clean HTML tags from content using BeautifulSoup
-            soup = bs(content, 'html.parser')
-            content = soup.get_text(separator="\n")
-            content = (content[:397] + '...') if len(content) > 400 else content
-
-            message = f"<a href='{entry.link}'><b>{entry.title}</b></a>\n<code>{utc_timestamp}</code>\n\n{content}"
-            context.bot.send_message(chat_id=chat_id, text=message, parse_mode='HTML')
-        except Exception as e:
-            print(f"Error while sending message: {str(e)}")
-
-    logging.info(f"Added URL {url}, fetched {len(entries)} entries")
-    joined_urls = "\n".join(url for url in url_list)
-    update.message.reply_text(f'☺️ Successfully added the RSS feeds:\n{joined_urls}')
-
-    # Inform the user about the XML/OPML file for backup
-    context.bot.send_message(chat_id=chat_id, text="🗃 Here's an XML/OPML file of your feeds for backup:")
-
-    filename = f"{chat_id}_feeds.xml"
-    try:
-        write_opml(feeds, filename)
-        user_feeds[chat_id] = feeds
-        context.bot.send_document(chat_id=chat_id, document=open(filename, 'rb'))
-    except Exception as e:
-        logging.error(f"Error while sending document: {str(e)}")
-        update.message.reply_text(f'😥 Failed to send document for {", ".join(url for url in url_list)}')
-        return FEED_URL
-
+    await context.bot.send_message(chat_id=chat_id, text="🗃 Here's an XML/OPML file of your feeds for backup:")
+    opml_bytes = write_opml(user_data.feeds)
+    await context.bot.send_document(chat_id=chat_id, document=opml_bytes, filename=f"{chat_id}_feeds.xml")
     return ConversationHandler.END
 
-def is_valid_url(url):
+def is_valid_url(url: str) -> bool:
     try:
         result = urlparse(url)
         return all([result.scheme, result.netloc])
     except ValueError:
         return False
 
-def cancel_add(update: Update, context: CallbackContext):
-    update.message.reply_text('Cancelled adding a feed.')
-    return ConversationHandler.END
+@get_user
+async def remove_start(update: Update, context: ContextTypes.DEFAULT_TYPE, user_data: UserData) -> int:
+    if not user_data.feeds:
+        await update.message.reply_text("🤷‍♀️ You have no feeds to remove. Use /add to add some.")
+        return ConversationHandler.END
+    feed_list = sorted([(feed["text"], feed["xmlUrl"]) for feed in user_data.feeds], key=lambda x: x[0])
+    message = "Your current feeds:\n\n" + "\n".join(f"{name}: {url}" for name, url in feed_list)
+    message += "\n\n🤔 Which feed would you like to remove? Send its URL."
+    await update.message.reply_text(message)
+    return ConversationState.REMOVE_FEED
 
-def remove_start(update: Update, context: CallbackContext) -> int:
+@user_lock
+@get_user
+async def remove_receive_feed(update: Update, context: ContextTypes.DEFAULT_TYPE, user_data: UserData):
     chat_id = update.effective_chat.id
-    global user_feeds
-
-    if chat_id not in user_feeds or not user_feeds[chat_id]:
-        message = '🤷‍♀️ You have no feeds to remove. You can add new feeds using the /add command.'
-    else:
-        feed_list = [(feed_dict['text'], feed_dict['xmlUrl']) for feed_dict in user_feeds[chat_id]]
-        feed_list.sort(key=lambda x: x[0])
-        message = "Here are your current feeds:\n\n"
-        for feed_name, feed_url in feed_list:
-            message += f"{feed_name}: {feed_url}\n"
-        message += "\n🤔 Which feed would you like to remove? Please send the feed title or URL."
-
-    update.message.reply_text(message)
-    return REMOVE_FEED
-
-def remove_receive_feed(update: Update, context: CallbackContext):
-    chat_id = update.effective_chat.id
-    global user_feeds
-
-    feed = update.message.text.strip()
-
-    if not feed:
-        update.message.reply_text('☝️ You must provide a feed title or URL')
-        return
-
-    if chat_id not in user_feeds or not user_feeds[chat_id]:
-        update.message.reply_text('🤷‍♀️ You have no feeds to remove.')
-        return
-
-    feed_to_remove = None
-    for feed_dict in user_feeds[chat_id]:
-        if feed_dict['text'] == feed or feed_dict['xmlUrl'] == feed:
-            feed_to_remove = feed_dict
-            break
+    shelf = context.bot_data['db']
+    feed_url = update.message.text.strip()
+    feed_to_remove = next((feed for feed in user_data.feeds if feed["xmlUrl"] == feed_url), None)
 
     if not feed_to_remove:
-        update.message.reply_text('🤷‍♀️ No matching feed found. Please check the feed title or URL and try again.')
-        return
-
-    user_feeds[chat_id] = [feed_dict for feed_dict in user_feeds[chat_id] if feed_dict != feed_to_remove]
-
-    # Generate and send the updated OPML file as a document to the user
-    opml_filename = f"{chat_id}_feeds.xml"
-    write_opml(user_feeds[chat_id], opml_filename)
-    with open(opml_filename, 'rb') as opml_file:
-        context.bot.send_document(chat_id=chat_id, document=opml_file)
-
-    update.message.reply_text(f'🧹 Removed feed: {feed_to_remove["text"]}')
-    return ConversationHandler.END
-
-def list_feeds(update: Update, context: CallbackContext):
-    chat_id = update.effective_chat.id
-    global user_feeds
-
-    try:
-        if chat_id not in user_feeds or not user_feeds[chat_id]:
-            update.message.reply_text('🤷‍♀️ You do not have any feeds. You can add new feeds using the /add command.')
-        else:
-            feed_list = [feed_dict['xmlUrl'] for feed_dict in user_feeds[chat_id]]
-            feed_list.sort()
-            feed_list = [f"<a href='{feed_url}'>{feed_url}</a>" for feed_url in feed_list]
-            update.message.reply_text('\n'.join(feed_list), parse_mode='HTML', disable_web_page_preview=True)
-
-            # Generate and send the OPML file as a document to the user
-            opml_filename = f"{chat_id}_feeds.xml"
-            write_opml(user_feeds[chat_id], opml_filename)
-            with open(opml_filename, 'rb') as opml_file:
-                context.bot.send_document(chat_id=chat_id, document=opml_file)
-
-    except Exception as e:
-        logging.error(f"Error in 'list_feeds' command: {str(e)}")
-        update.message.reply_text('😰 An error occurred while listing the feeds. Please try again.')
-
-def block_start(update: Update, context: CallbackContext) -> int:
-    update.message.reply_text('🔍 Please enter the word or phrase to block:')
-    return BLOCK_WORD
-
-def block_receive_word(update: Update, context: CallbackContext) -> int:
-    chat_id = update.message.chat_id
-    word = update.message.text.strip().lower()
-
-    # If the chat doesn't have a set of blocked words yet, create one
-    if chat_id not in blocked_words_dict:
-        blocked_words_dict[chat_id] = set()
-
-    if word not in blocked_words_dict[chat_id]:
-        blocked_words_dict[chat_id].add(word)
-        update.message.reply_text(f'🚫 Word blocked: {word}')
-    else:
-        update.message.reply_text(f'🤷‍♀️ Word is already blocked: {word}')
-    return ConversationHandler.END
-
-def unblock_start(update: Update, context: CallbackContext) -> int:
-    chat_id = update.message.chat_id
-    if chat_id in blocked_words_dict and blocked_words_dict[chat_id]:
-        update.message.reply_text('🗒 Select a word or phrase to unblock:\n' + '\n'.join(blocked_words_dict[chat_id]))
-        return UNBLOCK_WORD
-    else:
-        update.message.reply_text('🤷‍♀️ No blocked words or phrases.')
+        await update.message.reply_text("🤷‍♀️ No matching feed found with that URL.")
         return ConversationHandler.END
 
-def unblock_receive_word(update: Update, context: CallbackContext) -> int:
-    chat_id = update.message.chat_id
+    user_data.feeds.remove(feed_to_remove)
+    user_data.latest_post_time.pop(feed_to_remove['xmlUrl'], None) # Fix stale data bug
+    save_user_data(shelf, chat_id, user_data)
+
+    await update.message.reply_text(f"🧹 Removed feed: {feed_to_remove['text']}")
+    opml_bytes = write_opml(user_data.feeds)
+    await context.bot.send_document(chat_id=chat_id, document=opml_bytes, filename=f"{chat_id}_feeds.xml")
+    return ConversationHandler.END
+
+@get_user
+async def list_feeds(update: Update, context: ContextTypes.DEFAULT_TYPE, user_data: UserData):
+    chat_id = update.effective_chat.id
+    if not user_data.feeds:
+        await update.message.reply_text("🤷‍♀️ You do not have any feeds. Use /add to add some.")
+    else:
+        feed_list = sorted(f"<a href='{feed['xmlUrl']}'>{feed['text']}</a>" for feed in user_data.feeds)
+        await update.message.reply_text("Your feeds:\n" + "\n".join(feed_list), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        opml_bytes = write_opml(user_data.feeds)
+        await context.bot.send_document(chat_id=chat_id, document=opml_bytes, filename=f"{chat_id}_feeds.xml")
+
+async def block_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("🔍 Please enter the word or phrase to block:")
+    return ConversationState.BLOCK_WORD
+
+@user_lock
+@get_user
+async def block_receive_word(update: Update, context: ContextTypes.DEFAULT_TYPE, user_data: UserData) -> int:
     word = update.message.text.strip().lower()
-    if chat_id in blocked_words_dict and word in blocked_words_dict[chat_id]:
-        blocked_words_dict[chat_id].remove(word)
-        update.message.reply_text(f'🟢 Word unblocked: {word}')
+    if not word:
+        await update.message.reply_text("🤷‍♀️ Cannot block an empty word.")
+    elif word not in user_data.blocked_words:
+        user_data.blocked_words.add(word)
+        save_user_data(context.bot_data['db'], update.effective_chat.id, user_data)
+        await update.message.reply_text(f"🚫 Word blocked: {word}")
     else:
-        update.message.reply_text(f'❕ Word is not in the blocked list: {word}')
+        await update.message.reply_text(f"🤷‍♀️ Word already blocked: {word}")
     return ConversationHandler.END
 
-def list_blocked(update: Update, context: CallbackContext) -> None:
-    chat_id = update.message.chat_id
-    if chat_id in blocked_words_dict and blocked_words_dict[chat_id]:
-        update.message.reply_text('🚫 Blocked words:\n' + '\n'.join(blocked_words_dict[chat_id]))
-    else:
-        update.message.reply_text(' No blocked words.')
-
-def cancel(update: Update, context: CallbackContext) -> int:
-    update.message.reply_text('🛌 Command cancelled.')
+@get_user
+async def unblock_start(update: Update, context: ContextTypes.DEFAULT_TYPE, user_data: UserData) -> int:
+    if user_data.blocked_words:
+        blocked_list = "\n".join(sorted(list(user_data.blocked_words)))
+        await update.message.reply_text(f"🗒 Blocked words:\n{blocked_list}\n\nSend the word to unblock:")
+        return ConversationState.UNBLOCK_WORD
+    await update.message.reply_text("🤷‍♀️ No blocked words.")
     return ConversationHandler.END
 
-def welcome_user(update: Update, context: CallbackContext):
-    user_id = update.effective_user.id
+@user_lock
+@get_user
+async def unblock_receive_word(update: Update, context: ContextTypes.DEFAULT_TYPE, user_data: UserData) -> int:
+    word = update.message.text.strip().lower()
+    if word in user_data.blocked_words:
+        user_data.blocked_words.remove(word)
+        save_user_data(context.bot_data['db'], update.effective_chat.id, user_data)
+        await update.message.reply_text(f"🟢 Word unblocked: {word}")
+    else:
+        await update.message.reply_text(f"❕ Word not found in blocked list: {word}")
+    return ConversationHandler.END
 
-    # Check if the user has already interacted with the bot
-    if user_id not in users_started:
-        welcome_message = """
-        I am Yuna Reada, an RSS reader bot! 📚
+@get_user
+async def list_blocked(update: Update, context: ContextTypes.DEFAULT_TYPE, user_data: UserData):
+    if user_data.blocked_words:
+        await update.message.reply_text("🚫 Blocked words:\n" + "\n".join(sorted(list(user_data.blocked_words))))
+    else:
+        await update.message.reply_text("No blocked words.")
 
-Here are the available commands:
-/add ➕ Add feeds, send 5 latest entries
-/remove ➖ Remove feeds
-/block 🚫 Block words
-/unblock 🟢 Unblock words
-/blocked 📔 List blocked words
-/list 📓 List saved feeds
-/refresh 🌀 Force refresh feeds
-/cancel 🛌 Cancel command
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("🛌 Command cancelled.")
+    return ConversationHandler.END
 
-Have a Kindle? Send feed posts to your Kindle easily with @TheKindlerBot 📨
+@user_lock
+@get_user
+async def welcome_user(update: Update, context: ContextTypes.DEFAULT_TYPE, user_data: UserData):
+    # The @get_user decorator ensures user_data is created. We save it here to persist the new user.
+    save_user_data(context.bot_data['db'], update.effective_chat.id, user_data)
+    welcome = (
+        "I am Yuna Reada, an RSS reader bot! 📚\n\n"
+        "Available commands:\n"
+        "/add ➕ Add feeds\n"
+        "/remove ➖ Remove feeds\n"
+        "/list 📓 List saved feeds\n"
+        "/refresh 🌀 Force refresh feeds\n\n"
+        "/block 🚫 Block words\n"
+        "/unblock 🟢 Unblock words\n"
+        "/blocked 📔 List blocked words\n\n"
+        "/cancel 🛌 Cancel command\n\n"
+        f"I check feeds every {REFRESH_INTERVAL_SECONDS // 60} minutes. Use /add to begin!"
+    )
+    await context.bot.send_message(chat_id=update.effective_chat.id, text=welcome)
 
-I check feeds for new entries every 15 minutes.
-Send the /add command to begin! 🥰
-        """
-        context.bot.send_message(chat_id=update.effective_chat.id, text=welcome_message)
-        users_started.add(user_id)
-        context.job_queue.run_repeating(send_rss_updates, interval=900, first=0, context=context)
-
+# --- Main Application Setup ---
 def main():
-    try:
-        global BLOCK_WORD, UNBLOCK_WORD
-        updater = Updater(token=TELEGRAM_BOT_TOKEN, use_context=True)
+    """Sets up and runs the bot."""
+    with shelve.open('user_data.db', writeback=False) as db:
+        application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+        application.bot_data['db'] = db
 
-        dispatcher = updater.dispatcher
-
-        logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-                            level=logging.WARNING)
-
-        add_handler = ConversationHandler(
-            entry_points=[CommandHandler('add', add_start)],
-            states={
-                FEED_URL: [MessageHandler(Filters.text & ~Filters.command, add_receive_url)],
-            },
-            fallbacks=[CommandHandler('cancel', cancel)],
+        add_conv = ConversationHandler(
+            entry_points=[CommandHandler("add", add_start)],
+            states={ConversationState.FEED_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_receive_url)]},
+            fallbacks=[CommandHandler("cancel", cancel)],
+        )
+        remove_conv = ConversationHandler(
+            entry_points=[CommandHandler("remove", remove_start)],
+            states={ConversationState.REMOVE_FEED: [MessageHandler(filters.TEXT & ~filters.COMMAND, remove_receive_feed)]},
+            fallbacks=[CommandHandler("cancel", cancel)],
+        )
+        block_conv = ConversationHandler(
+            entry_points=[CommandHandler("block", block_start)],
+            states={ConversationState.BLOCK_WORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, block_receive_word)]},
+            fallbacks=[CommandHandler("cancel", cancel)],
+        )
+        unblock_conv = ConversationHandler(
+            entry_points=[CommandHandler("unblock", unblock_start)],
+            states={ConversationState.UNBLOCK_WORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, unblock_receive_word)]},
+            fallbacks=[CommandHandler("cancel", cancel)],
         )
 
-        remove_handler = ConversationHandler(
-            entry_points=[CommandHandler('remove', remove_start)],
-            states={
-                REMOVE_FEED: [MessageHandler(Filters.text & ~Filters.command, remove_receive_feed)],
-            },
-            fallbacks=[CommandHandler('cancel', cancel)],
-        )
+        application.add_handler(add_conv)
+        application.add_handler(remove_conv)
+        application.add_handler(block_conv)
+        application.add_handler(unblock_conv)
+        application.add_handler(CommandHandler("list", list_feeds))
+        application.add_handler(CommandHandler("refresh", refresh))
+        application.add_handler(CommandHandler("blocked", list_blocked))
+        application.add_handler(CommandHandler("start", welcome_user))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, welcome_user))
 
-        block_handler = ConversationHandler(
-            entry_points=[CommandHandler('block', block_start)],
-            states={
-                BLOCK_WORD: [MessageHandler(Filters.text & ~Filters.command, block_receive_word)],
-            },
-            fallbacks=[CommandHandler('cancel', cancel)],
-        )
+        application.job_queue.run_repeating(send_rss_updates, interval=REFRESH_INTERVAL_SECONDS, first=10)
+        application.run_polling()
 
-        unblock_handler = ConversationHandler(
-            entry_points=[CommandHandler('unblock', unblock_start)],
-            states={
-                UNBLOCK_WORD: [MessageHandler(Filters.text & ~Filters.command, unblock_receive_word)],
-            },
-            fallbacks=[CommandHandler('cancel', cancel)],
-        )
-
-        dispatcher.add_handler(remove_handler)
-        dispatcher.add_handler(add_handler)
-        dispatcher.add_handler(CommandHandler('list', list_feeds))
-        dispatcher.add_handler(CommandHandler('refresh', refresh))
-        dispatcher.add_handler(CommandHandler('blocked', list_blocked))
-        dispatcher.add_handler(unblock_handler)
-        dispatcher.add_handler(block_handler)
-        dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, welcome_user))
-
-        updater.start_polling()
-        updater.idle()
-
-    except Exception as e:
-        logging.error(f"An error occurred in the main function: {str(e)}")
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
