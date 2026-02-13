@@ -14,7 +14,7 @@ import time
 import calendar
 import sqlite3
 import html
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse
 import xml.etree.ElementTree as ET
@@ -22,7 +22,7 @@ import requests
 from dotenv import load_dotenv
 import feedparser
 from bs4 import BeautifulSoup as bs
-from telegram import Update, BotCommand
+from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder,
@@ -31,6 +31,7 @@ from telegram.ext import (
     MessageHandler,
     ContextTypes,
     filters,
+    CallbackQueryHandler,
     JobQueue
 )
 import nest_asyncio
@@ -281,6 +282,37 @@ UPDATE_LOCK = asyncio.Lock()
 # Conversation states
 FEED_URL, REMOVE_FEED, BLOCK_WORD, UNBLOCK_WORD = range(1, 5)
 
+# --- Scheduling Helpers ---
+def _next_aligned_run(now_ts: float, frequency: str) -> float:
+    now = datetime.fromtimestamp(now_ts, tz=timezone.utc)
+    if frequency == "daily":
+        next_midnight = datetime(now.year, now.month, now.day, tzinfo=timezone.utc) + timedelta(days=1)
+        return next_midnight.timestamp()
+
+    minutes_since_midnight = now.hour * 60 + now.minute
+    next_slot = (minutes_since_midnight // 15 + 1) * 15
+    next_day = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+    if next_slot >= 24 * 60:
+        next_day += timedelta(days=1)
+        next_slot = 0
+    return (next_day + timedelta(minutes=next_slot)).timestamp()
+
+def _get_frequency(chat_id: int) -> str:
+    freq = get_setting(chat_id, "frequency", "15m") or "15m"
+    return freq if freq in {"15m", "daily"} else "15m"
+
+def _set_next_run(chat_id: int, next_run_ts: float):
+    set_setting(chat_id, "next_run", str(next_run_ts))
+
+def _get_next_run(chat_id: int) -> float | None:
+    value = get_setting(chat_id, "next_run")
+    if not value:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
 # --- RSS Fetching (blocking) ---
 def _entry_id(entry) -> str:
     return (
@@ -449,6 +481,7 @@ async def fetch_and_send_updates(context: ContextTypes.DEFAULT_TYPE, chat_id: in
                 message = (f"<a href='{safe_link}'><b>{safe_title}</b></a>\n"
                            f"<code>{timestamp}</code>\n\n{safe_content}")
                 await bot.send_message(chat_id=chat_id, text=message, parse_mode=ParseMode.HTML)
+                await asyncio.sleep(0.25)
             except Exception as e:
                 logging.error(f"Error sending message for chat {chat_id}: {e}", exc_info=True)
 
@@ -460,17 +493,47 @@ async def fetch_and_send_updates(context: ContextTypes.DEFAULT_TYPE, chat_id: in
             safe_link = html.escape(entry.link or "", quote=True)
             blocked_message += f'<a href="{safe_link}">{safe_title}</a>\n'
         await bot.send_message(chat_id=chat_id, text=blocked_message, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        await asyncio.sleep(0.25)
 
-async def send_rss_updates(context: ContextTypes.DEFAULT_TYPE):
+async def run_immediate_then_sync(context: ContextTypes.DEFAULT_TYPE):
     if UPDATE_LOCK.locked():
-        logging.warning("Skipping update cycle: previous cycle still running.")
+        logging.warning("Skipping immediate sync: previous cycle still running.")
         return
     async with UPDATE_LOCK:
-        # Launch updates concurrently for all chats
+        chat_ids = get_chat_ids()
+        if chat_ids:
+            await asyncio.gather(*(fetch_and_send_updates(context, chat_id) for chat_id in chat_ids))
+        now = time.time()
+        for chat_id in chat_ids:
+            freq = _get_frequency(chat_id)
+            _set_next_run(chat_id, _next_aligned_run(now, freq))
+
+async def scheduled_tick(context: ContextTypes.DEFAULT_TYPE):
+    if UPDATE_LOCK.locked():
+        logging.warning("Skipping scheduled tick: previous cycle still running.")
+        return
+    async with UPDATE_LOCK:
+        now = time.time()
         chat_ids = get_chat_ids()
         if not chat_ids:
             return
-        await asyncio.gather(*(fetch_and_send_updates(context, chat_id) for chat_id in chat_ids))
+
+        due = []
+        for chat_id in chat_ids:
+            freq = _get_frequency(chat_id)
+            next_run = _get_next_run(chat_id)
+            if next_run is None:
+                _set_next_run(chat_id, _next_aligned_run(now, freq))
+                continue
+            if now >= next_run:
+                due.append(chat_id)
+
+        if due:
+            await asyncio.gather(*(fetch_and_send_updates(context, chat_id) for chat_id in due))
+            now = time.time()
+            for chat_id in due:
+                freq = _get_frequency(chat_id)
+                _set_next_run(chat_id, _next_aligned_run(now, freq))
 
 async def refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -507,6 +570,7 @@ async def _send_digest(bot, chat_id: int, entries: list):
 
     for chunk in chunks:
         await bot.send_message(chat_id=chat_id, text=chunk, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        await asyncio.sleep(0.25)
 
 # --- OPML Helpers ---
 def write_opml(feeds, filename):
@@ -590,6 +654,7 @@ async def add_receive_url(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 message = (f"<a href='{safe_link}'><b>{safe_title}</b></a>\n"
                            f"<code>{timestamp}</code>\n\n{safe_content}")
                 await context.bot.send_message(chat_id=chat_id, text=message, parse_mode=ParseMode.HTML)
+                await asyncio.sleep(0.25)
             except Exception as e:
                 logging.error(f"Error sending feed entry: {e}", exc_info=True)
     else:
@@ -758,6 +823,43 @@ async def digest(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     await update.message.reply_text(message)
 
+async def frequency(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [
+            InlineKeyboardButton("Daily", callback_data="frequency:daily"),
+            InlineKeyboardButton("15m", callback_data="frequency:15m"),
+        ]
+    ]
+    await update.message.reply_text(
+        "Choose update frequency:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+async def frequency_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not query.data:
+        return
+    if not query.data.startswith("frequency:"):
+        return
+    choice = query.data.split(":", 1)[1]
+    if choice not in {"daily", "15m"}:
+        await query.answer("Unknown choice.", show_alert=False)
+        return
+    await query.answer()
+    chat_id = query.message.chat_id
+    set_setting(chat_id, "frequency", choice)
+    next_run = _next_aligned_run(time.time(), choice)
+    _set_next_run(chat_id, next_run)
+    next_dt = datetime.fromtimestamp(next_run, tz=timezone.utc)
+    if choice == "daily":
+        label = "Daily at 00:00 UTC"
+    else:
+        label = "Every 15 minutes from 00:00 UTC"
+    await query.edit_message_text(
+        f"✅ Update frequency set to {label}.\n"
+        f"Next scheduled run: {next_dt:%Y-%m-%d %H:%M:%S} UTC"
+    )
+
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     feeds = get_feeds(chat_id)
@@ -796,9 +898,11 @@ async def welcome_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/list 📓 List saved feeds\n"
         "/refresh 🌀 Force refresh feeds\n"
         "/digest 🗞️ Toggle digest mode\n"
+        "/frequency 🕒 Set update frequency\n"
         "/status 📊 Show status\n"
         "/cancel 🛌 Cancel command\n\n"
-        "I check feeds every 15 minutes. Use /add to begin!"
+        "I check feeds every 15 minutes. Use /frequency to change it.\n"
+        "Use /add to begin!"
     )
     await context.bot.send_message(chat_id=chat_id, text=welcome)
 
@@ -823,6 +927,7 @@ async def main():
         BotCommand("list", "List saved feeds"),
         BotCommand("refresh", "Fetch updates now"),
         BotCommand("digest", "Toggle digest mode"),
+        BotCommand("frequency", "Set update frequency"),
         BotCommand("status", "Show status"),
         BotCommand("cancel", "Cancel the current command"),
     ])
@@ -833,11 +938,22 @@ async def main():
         application.job_queue = job_queue
         job_queue.start()
 
-    # Job to check feeds every 15 minutes
+    # Run immediately on startup, then sync to the next scheduled update time.
+    application.job_queue.run_once(
+        run_immediate_then_sync,
+        when=0,
+        job_kwargs={
+            "coalesce": True,
+            "max_instances": 1,
+            "misfire_grace_time": 60,
+        },
+    )
+
+    # Tick schedule to send due updates (aligned to UTC).
     application.job_queue.run_repeating(
-        send_rss_updates,
-        interval=900,
-        first=0,
+        scheduled_tick,
+        interval=60,
+        first=60,
         job_kwargs={
             "coalesce": True,
             "max_instances": 1,
@@ -849,24 +965,28 @@ async def main():
         entry_points=[CommandHandler("add", add_start)],
         states={FEED_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_receive_url)]},
         fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
     )
 
     remove_conv = ConversationHandler(
         entry_points=[CommandHandler("remove", remove_start)],
         states={REMOVE_FEED: [MessageHandler(filters.TEXT & ~filters.COMMAND, remove_receive_feed)]},
         fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
     )
 
     block_conv = ConversationHandler(
         entry_points=[CommandHandler("block", block_start)],
         states={BLOCK_WORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, block_receive_word)]},
         fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
     )
 
     unblock_conv = ConversationHandler(
         entry_points=[CommandHandler("unblock", unblock_start)],
         states={UNBLOCK_WORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, unblock_receive_word)]},
         fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
     )
 
     application.add_handler(add_conv)
@@ -877,6 +997,8 @@ async def main():
     application.add_handler(CommandHandler("refresh", refresh))
     application.add_handler(CommandHandler("blocked", list_blocked))
     application.add_handler(CommandHandler("digest", digest))
+    application.add_handler(CommandHandler("frequency", frequency))
+    application.add_handler(CallbackQueryHandler(frequency_choice))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(block_conv)
     application.add_handler(unblock_conv)
