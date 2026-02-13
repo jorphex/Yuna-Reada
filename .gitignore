@@ -1,0 +1,6 @@
+# Local DB files
+/yunareada.db
+/yunareada.db-*
+
+# Feed exports
+/*_feeds.xml
