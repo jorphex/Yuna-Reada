@@ -828,12 +828,14 @@ async def frequency(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [
             InlineKeyboardButton("Daily", callback_data="frequency:daily"),
             InlineKeyboardButton("15m", callback_data="frequency:15m"),
+            InlineKeyboardButton("Cancel", callback_data="frequency:cancel"),
         ]
     ]
-    await update.message.reply_text(
+    msg = await update.message.reply_text(
         "Choose update frequency:",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
+    set_setting(update.effective_chat.id, "frequency_prompt_msg", str(msg.message_id))
 
 async def frequency_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -842,6 +844,12 @@ async def frequency_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not query.data.startswith("frequency:"):
         return
     choice = query.data.split(":", 1)[1]
+    if choice == "cancel":
+        chat_id = query.message.chat_id
+        await query.answer()
+        set_setting(chat_id, "frequency_prompt_msg", "")
+        await query.edit_message_text("🛌 Command cancelled.")
+        return
     if choice not in {"daily", "15m"}:
         await query.answer("Unknown choice.", show_alert=False)
         return
@@ -855,6 +863,7 @@ async def frequency_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         label = "Daily at 00:00 UTC"
     else:
         label = "Every 15 minutes from 00:00 UTC"
+    set_setting(chat_id, "frequency_prompt_msg", "")
     await query.edit_message_text(
         f"✅ Update frequency set to {label}.\n"
         f"Next scheduled run: {next_dt:%Y-%m-%d %H:%M:%S} UTC"
@@ -881,6 +890,14 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    chat_id = update.effective_chat.id
+    prompt_id = get_setting(chat_id, "frequency_prompt_msg")
+    if prompt_id:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=int(prompt_id))
+        except Exception:
+            pass
+        set_setting(chat_id, "frequency_prompt_msg", "")
     await update.message.reply_text("🛌 Command cancelled.")
     return ConversationHandler.END
 
@@ -995,6 +1012,7 @@ async def main():
     application.add_handler(CommandHandler("start", welcome_user))
     application.add_handler(CommandHandler("list", list_feeds))
     application.add_handler(CommandHandler("refresh", refresh))
+    application.add_handler(CommandHandler("cancel", cancel))
     application.add_handler(CommandHandler("blocked", list_blocked))
     application.add_handler(CommandHandler("digest", digest))
     application.add_handler(CommandHandler("frequency", frequency))
