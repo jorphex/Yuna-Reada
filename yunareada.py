@@ -1,27 +1,22 @@
-import warnings
-warnings.filterwarnings(
-    "ignore",
-    message=r"pkg_resources is deprecated as an API\..*",
-    category=UserWarning,
-)
-
 import asyncio
+import calendar
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+import html
 import logging
 import os
 import re
+import sqlite3
 import sys
 import time
-import calendar
-import sqlite3
-import html
-from datetime import datetime, timezone, timedelta
-from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse
+import warnings
 import xml.etree.ElementTree as ET
-import requests
+from bs4 import BeautifulSoup as bs
 from dotenv import load_dotenv
 import feedparser
-from bs4 import BeautifulSoup as bs
+import nest_asyncio
+import requests
 from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -34,7 +29,13 @@ from telegram.ext import (
     CallbackQueryHandler,
     JobQueue
 )
-import nest_asyncio
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"pkg_resources is deprecated as an API\..*",
+    category=UserWarning,
+)
+
 nest_asyncio.apply()
 
 load_dotenv()
@@ -323,7 +324,6 @@ def _entry_id(entry) -> str:
     )
 
 def fetch_rss(chat_id: int, url: str, latest_post_time: float, blocked_words: set[str]):
-    start_time = time.time()
     # logging.info(f"Start fetching RSS for chat {chat_id}, URL {url}")
 
     try:
