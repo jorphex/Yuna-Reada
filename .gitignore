@@ -8,3 +8,7 @@
 # Local orchestration notes
 /AGENTS.md
 /MYNOTES.md
+/NOTES.md
+
+# Local Docker config
+/Dockerfile
