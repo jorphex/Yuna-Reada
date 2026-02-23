@@ -12,3 +12,6 @@
 
 # Local Docker config
 /Dockerfile
+
+# Env secrets
+/.env
