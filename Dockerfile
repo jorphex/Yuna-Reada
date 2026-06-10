@@ -12,5 +12,6 @@ RUN pip install --no-cache-dir --disable-pip-version-check --no-compile -r requi
 
 # Copy the bot code into the container
 COPY yunareada.py .
+COPY yuna ./yuna
 
 CMD [ "python", "yunareada.py" ]
